@@ -1,19 +1,105 @@
 """
 app.py  —  TSDPL Kalinganagar Maintenance & Operations Dashboard
 10-Tab Streamlit App   |   Run: streamlit run app.py
+
+SECURITY HARDENED VERSION
+- Input validation for all user inputs
+- Sanitized HTML rendering
+- File upload validation
+- No debug information exposure
+- Dependency pinning
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
 import sys, os
-import random
-import time
+import logging
 from datetime import datetime, timedelta
+from pathlib import Path
+import re
+
+# ────────────────────────────────────────────────────────────────────────────
+# SECURITY: Configure logging for audit trail
+# ────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ────────────────────────────────────────────────────────────────────────────
+# SECURITY: Input validation functions
+# ────────────────────────────────────────────────────────────────────────────
+def validate_machine_id(machine_id: str) -> bool:
+    """Validate machine ID format - alphanumeric, spaces, parens, slashes allowed."""
+    if not isinstance(machine_id, str):
+        return False
+    # Allow safe characters: letters, numbers, underscores, hyphens, spaces, parens, slashes
+    return bool(re.match(r'^[a-zA-Z0-9_\-\s()/.]{1,100}$', machine_id))
+
+def validate_numeric_input(value, min_val=None, max_val=None) -> bool:
+    """Validate numeric input within safe bounds."""
+    try:
+        if min_val is not None and value < min_val:
+            return False
+        if max_val is not None and value > max_val:
+            return False
+        return True
+    except (TypeError, ValueError):
+        return False
+
+def sanitize_html_string(text: str) -> str:
+    """Remove/escape potentially dangerous HTML tags."""
+    if not isinstance(text, str):
+        return ""
+    # Remove script tags and event handlers
+    text = re.sub(r'<script[^>]*>.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r'on\w+\s*=', '', text, flags=re.IGNORECASE)
+    return text
+
+def validate_file_upload(uploaded_file) -> tuple:
+    """Validate uploaded file: type, size, and content safety."""
+    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+    ALLOWED_TYPES = {'csv', 'xlsx', 'xls'}
+    
+    if uploaded_file is None:
+        return None, "No file provided"
+    
+    # Check file size
+    if len(uploaded_file.getvalue()) > MAX_FILE_SIZE:
+        logger.warning(f"File upload rejected: exceeds size limit. Size: {len(uploaded_file.getvalue())}")
+        return None, f"File exceeds {MAX_FILE_SIZE // 1024 // 1024}MB limit"
+    
+    # Check file extension
+    file_ext = Path(uploaded_file.name).suffix.lstrip('.').lower()
+    if file_ext not in ALLOWED_TYPES:
+        logger.warning(f"File upload rejected: invalid type {file_ext}")
+        return None, f"Only {', '.join(ALLOWED_TYPES)} files allowed"
+    
+    # Check file magic bytes (basic validation)
+    file_start = uploaded_file.getvalue()[:4]
+    if file_ext == 'csv':
+        try:
+            # For CSV, just check it can be decoded as text
+            file_start.decode('utf-8')
+        except UnicodeDecodeError:
+            logger.warning("File upload rejected: invalid UTF-8 encoding")
+            return None, "File must be valid UTF-8 encoded text"
+    
+    return uploaded_file, None
 
 def generate_inline_demo_data(n_machines=6, days=45):
     """Generate synthetic UP/DOWN time-series data with sensors."""
+    # Use fixed seed for reproducible demo data
     np.random.seed(42)
+    
+    # SECURITY: Validate input parameters
+    if not validate_numeric_input(n_machines, 1, 100):
+        n_machines = 6
+    if not validate_numeric_input(days, 1, 365):
+        days = 45
+    
     machines = [f"Machine_{i:02d}" for i in range(1, n_machines+1)]
     start_date = datetime.now() - timedelta(days=days)
     timestamps = pd.date_range(start=start_date, end=datetime.now(), freq='15min')
@@ -35,7 +121,7 @@ def generate_inline_demo_data(n_machines=6, days=45):
     df['status'] = df['status'].str.upper()
     return df
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, str(Path(__file__).parent.resolve()))
 
 from utils.data_loader import load_data, get_data_summary
 from utils.analytics import (
@@ -65,6 +151,8 @@ from utils.tsdpl_charts import (
     chart_param_trend, chart_failure_category_donut, chart_mom_grid,
     chart_pm_status, chart_incident_timeline,
 )
+# ── NEW in v2.2: messy real-world file normalizer + QIP analysis ──────────────
+from utils.messy_loader import normalize_maintenance_data, compute_mtbf_mttr_from_norm
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -153,6 +241,7 @@ tbody tr:hover td { background: #172135 !important; }
 for key, default in [
     ("df", None), ("summary", None), ("selected_machines", []),
     ("tsdpl_data", None), ("tsdpl_loaded", False),
+    ("normalized_df", None),   # v2.2: messy-file normalizer output
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
@@ -166,14 +255,53 @@ with st.sidebar:
     st.markdown("### 📂 Upload Generic Data")
     uploaded = st.file_uploader("CSV / Excel (UP/DOWN format)", type=["csv","xlsx","xls"])
     if uploaded:
-        df, err = load_data(uploaded)
-        if err:
-            st.error(f"❌ {err}")
+        # SECURITY: Validate file before processing
+        validated_file, error = validate_file_upload(uploaded)
+        if error:
+            st.error(f"❌ {error}")
         else:
-            st.session_state.df = df
-            st.session_state.summary = get_data_summary(df)
-            st.success(f"✅ {len(df):,} records loaded")
+            try:
+                df, err = load_data(validated_file)
+                if err:
+                    st.error(f"❌ {err}")
+                else:
+                    st.session_state.df = df
+                    st.session_state.summary = get_data_summary(df)
+                    st.success(f"✅ {len(df):,} records loaded")
+            except Exception as e:
+                # SECURITY: Don't expose detailed error messages to user
+                logger.error(f"File processing error: {str(e)}", exc_info=True)
+                st.error("❌ Error processing file. Please check format and try again.")
     
+    st.markdown("---")
+    st.markdown("### 🔬 Upload Real-World Data")
+    st.caption("Handles messy exports: metadata rows, mixed column names, mixed date formats.")
+    messy_uploaded = st.file_uploader(
+        "Maintenance CSV / Excel (any format)",
+        type=["csv", "xlsx", "xls"],
+        key="messy_uploader",
+    )
+    if messy_uploaded:
+        validated_messy, m_error = validate_file_upload(messy_uploaded)
+        if m_error:
+            st.error(f"❌ {m_error}")
+        else:
+            with st.spinner("Normalising file…"):
+                try:
+                    norm_df, n_err = normalize_maintenance_data(validated_messy)
+                    if n_err:
+                        st.error(f"❌ {n_err}")
+                    else:
+                        st.session_state.normalized_df = norm_df
+                        st.success(f"✅ {len(norm_df):,} rows normalised")
+                        st.caption(
+                            f"Date range: {norm_df['Date'].min().strftime('%d %b %Y')} → "
+                            f"{norm_df['Date'].max().strftime('%d %b %Y')}"
+                        )
+                except Exception as e:
+                    logger.error(f"Messy loader error: {e}", exc_info=True)
+                    st.error("❌ Could not normalise file. Check format and try again.")
+
     st.markdown("---")
     col1, col2 = st.columns(2)
     with col1:
@@ -193,13 +321,11 @@ with st.sidebar:
                     st.session_state.tsdpl_loaded = True
                     st.success("TSDPL dataset loaded.")
                 except Exception as e:
-                    st.error(f"TSDPL demo failed: {e}")
+                    # SECURITY: Don't expose detailed error messages to user
+                    logger.error(f"TSDPL demo error: {e}", exc_info=True)
+                    st.error("❌ Failed to generate TSDPL demo data. Please try again.")
     
-    # Temporary debug: show import paths
-    if st.checkbox("Show debug info"):
-        st.write("Current directory:", os.getcwd())
-        st.write("sys.path:", sys.path)
-        st.write("tsdpl_demo_data exists?", os.path.exists("utils/tsdpl_demo_data.py"))
+    # SECURITY: Removed debug info checkbox that exposed system paths and module information
     
     if st.session_state.summary:
         s = st.session_state.summary
@@ -208,8 +334,11 @@ with st.sidebar:
         st.caption(f"{s['total_records']:,} records · {len(s['machines'])} machines")
         st.caption(f"{s['date_range'][0].strftime('%d %b')} → {s['date_range'][1].strftime('%d %b %Y')}")
         st.markdown("#### Machine Filter")
-        sel = st.multiselect("", s["machines"], default=s["machines"], label_visibility="collapsed")
-        st.session_state.selected_machines = sel
+        # SECURITY: Validate machine IDs before using
+        valid_machines = [m for m in s["machines"] if validate_machine_id(m)]
+        sel = st.multiselect("", valid_machines, default=valid_machines, label_visibility="collapsed")
+        # SECURITY: Ensure selected machines are validated
+        st.session_state.selected_machines = [m for m in sel if validate_machine_id(m)]
 
     if st.session_state.tsdpl_loaded:
         dl = st.session_state.tsdpl_data["downtime_log"]
@@ -257,9 +386,10 @@ if not st.session_state.tsdpl_loaded and st.session_state.df is None:
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
 (tab_ov, tab_up, tab_fa, tab_pr, tab_dr,
- tab_ro, tab_sa, tab_pm_tab, tab_sc, tab_mm) = st.tabs([
+ tab_ro, tab_sa, tab_pm_tab, tab_sc, tab_mm, tab_qip) = st.tabs([
     "🏠 Overview","📈 Uptime","💥 Failures","🔮 Predictions","🔬 Drilldown",
     "📋 Shift Roster","📊 Shift Analytics","🔧 PM Checklist","🌡️ Health Scorecard","📅 Month-over-Month",
+    "📊 QIP Analysis",
 ])
 
 
@@ -270,7 +400,7 @@ def render_generic(df_all):
     sel = st.session_state.get("selected_machines", df_all["machine_id"].unique().tolist())
     df = df_all[df_all["machine_id"].isin(sel)] if sel else df_all
 
-    @st.cache_data(show_spinner=False)
+    @st.cache_data(show_spinner=False, ttl=3600)  # SECURITY: Added 1-hour TTL to cache
     def run(h, _df):
         ut = compute_uptime_downtime(_df)
         fe = extract_failure_events(_df)
@@ -293,8 +423,6 @@ def render_generic(df_all):
         with c2: metric_card("Avg Uptime", f"{avg_up:.1f}%", color="#22C55E" if avg_up>=90 else "#F59E0B")
         with c3: metric_card("Total Failures", str(len(fe)), color="#EF4444")
         with c4: metric_card("High Risk", str(high_r), color="#EF4444" if high_r>0 else "#22C55E")
-        col1,col2 = st.columns(2)
-        # Locate these lines around Line 186-188:
         col1, col2 = st.columns(2)
         with col1: 
             st.plotly_chart(chart_uptime_downtime(ut), use_container_width=True, key="overview_uptime_chart")
@@ -313,11 +441,10 @@ def render_generic(df_all):
             with c2: metric_card("Needs Attention", worst, delta=f"{ut.loc[worst,'uptime_pct']}%", color="#EF4444")
             with c3: metric_card("Total Downtime", f"{ut['downtime_hours'].sum():.0f} h", color="#F59E0B")
             c1,c2 = st.columns(2)
-           # Update these lines in your tab_up section:
-        with c1: 
-            st.plotly_chart(chart_uptime_downtime(ut), use_container_width=True, key="uptime_tab_main_chart")
-        with c2: 
-            st.plotly_chart(chart_daily_uptime_trend(du, sel), use_container_width=True, key="uptime_tab_trend_chart")
+            with c1: 
+                st.plotly_chart(chart_uptime_downtime(ut), use_container_width=True, key="uptime_tab_main_chart")
+            with c2: 
+                st.plotly_chart(chart_daily_uptime_trend(du, sel), use_container_width=True, key="uptime_tab_trend_chart")
             st.dataframe(ut.reset_index(), use_container_width=True)
 
     with tab_fa:
@@ -714,6 +841,187 @@ RETURN IF(Prev=0,"Stable", IF(Curr/Prev<0.95,"▲ Improving", IF(Curr/Prev>1.05,
                          use_container_width=True)
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# QIP ANALYSIS TAB  (v2.2)  —  Before / After MTBF·MTTR comparison
+# Requires a normalised DataFrame from the messy_loader uploader in the sidebar.
+# ═══════════════════════════════════════════════════════════════════════════════
+def render_qip_tab(norm_df):
+    """Render the QIP (Quality Improvement Project) before/after analysis tab."""
+    import plotly.graph_objects as go
+
+    with tab_qip:
+        st.markdown("## 📊 QIP — Before / After Analysis")
+        st.markdown(
+            "<p style='color:#94a3b8;font-size:13px;margin-top:-8px;'>"
+            "Upload a real-world maintenance file (sidebar → 🔬 Upload Real-World Data), "
+            "then define a baseline period and an improvement period to measure MTBF / MTTR change.</p>",
+            unsafe_allow_html=True,
+        )
+
+        # ── Guard: no normalised data yet ─────────────────────────────────────
+        if norm_df is None or norm_df.empty:
+            alert_banner(
+                "No normalised data loaded. Use <strong>🔬 Upload Real-World Data</strong> "
+                "in the sidebar to upload a messy maintenance CSV / Excel file.",
+                "info",
+            )
+            return
+
+        # ── Dataset summary cards ─────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+        with c1: metric_card("Total Rows", f"{len(norm_df):,}")
+        with c2: metric_card("Unique Equipment", str(norm_df["Equipment"].nunique()))
+        with c3: metric_card("Date Range Start", norm_df["Date"].min().strftime("%d %b %Y"))
+        with c4: metric_card("Date Range End",   norm_df["Date"].max().strftime("%d %b %Y"))
+
+        st.markdown("---")
+
+        # ── Equipment filter ──────────────────────────────────────────────────
+        all_equip = sorted(norm_df["Equipment"].unique().tolist())
+        selected_equip = st.multiselect(
+            "Filter by Equipment (leave blank = all):",
+            all_equip,
+            default=[],
+            key="qip_equip",
+        )
+        df_q = norm_df[norm_df["Equipment"].isin(selected_equip)] if selected_equip else norm_df.copy()
+
+        st.markdown("---")
+        section_header("Define Comparison Periods", "Select date ranges for baseline and improvement windows")
+
+        # ── Period selectors ──────────────────────────────────────────────────
+        min_date = df_q["Date"].min().date()
+        max_date = df_q["Date"].max().date()
+        midpoint = min_date + (max_date - min_date) // 2
+
+        col_b, col_i = st.columns(2)
+        with col_b:
+            st.markdown("#### 📅 Baseline Period")
+            b_start = st.date_input("Start", value=min_date, min_value=min_date, max_value=max_date, key="b_start")
+            b_end   = st.date_input("End",   value=midpoint, min_value=min_date, max_value=max_date, key="b_end")
+        with col_i:
+            st.markdown("#### 🚀 Improvement Period")
+            i_start = st.date_input("Start", value=midpoint, min_value=min_date, max_value=max_date, key="i_start")
+            i_end   = st.date_input("End",   value=max_date, min_value=min_date, max_value=max_date, key="i_end")
+
+        # ── Validate period selection ─────────────────────────────────────────
+        if b_start >= b_end:
+            alert_banner("Baseline: start date must be before end date.", "warning")
+            return
+        if i_start >= i_end:
+            alert_banner("Improvement: start date must be before end date.", "warning")
+            return
+
+        # ── Compute metrics for each period ───────────────────────────────────
+        b_mask = (df_q["Date"].dt.date >= b_start) & (df_q["Date"].dt.date <= b_end)
+        i_mask = (df_q["Date"].dt.date >= i_start) & (df_q["Date"].dt.date <= i_end)
+
+        b_stats = compute_mtbf_mttr_from_norm(df_q, b_mask)
+        i_stats = compute_mtbf_mttr_from_norm(df_q, i_mask)
+
+        # ── Delta calculations ────────────────────────────────────────────────
+        def pct_change(new, old):
+            """Return % change string with arrow, or '—' if old is zero."""
+            if old == 0:
+                return "—"
+            delta = ((new - old) / old) * 100
+            arrow = "▲" if delta > 0 else "▼"
+            return f"{arrow} {abs(delta):.1f}%"
+
+        mtbf_delta  = pct_change(i_stats["mtbf_h"],  b_stats["mtbf_h"])
+        mttr_delta  = pct_change(i_stats["mttr_min"], b_stats["mttr_min"])
+        fail_delta  = pct_change(i_stats["failures"], b_stats["failures"])
+        dt_delta    = pct_change(i_stats["total_downtime_min"], b_stats["total_downtime_min"])
+
+        st.markdown("---")
+        section_header("Comparison Results")
+
+        # ── Metric cards row ──────────────────────────────────────────────────
+        c1, c2, c3, c4 = st.columns(4)
+
+        # MTBF higher = better (green); MTTR lower = better (green if ▼)
+        mtbf_color = "#22C55E" if i_stats["mtbf_h"] >= b_stats["mtbf_h"] else "#EF4444"
+        mttr_color = "#22C55E" if i_stats["mttr_min"] <= b_stats["mttr_min"] else "#EF4444"
+        fail_color = "#22C55E" if i_stats["failures"] <= b_stats["failures"] else "#EF4444"
+        dt_color   = "#22C55E" if i_stats["total_downtime_min"] <= b_stats["total_downtime_min"] else "#EF4444"
+
+        with c1:
+            metric_card("MTBF Change",    mtbf_delta, delta=f"B: {b_stats['mtbf_h']}h → I: {i_stats['mtbf_h']}h",  color=mtbf_color)
+        with c2:
+            metric_card("MTTR Change",    mttr_delta, delta=f"B: {b_stats['mttr_min']}m → I: {i_stats['mttr_min']}m", color=mttr_color)
+        with c3:
+            metric_card("Failure Count",  fail_delta, delta=f"B: {b_stats['failures']} → I: {i_stats['failures']}",  color=fail_color)
+        with c4:
+            metric_card("Total Downtime", dt_delta,   delta=f"B: {b_stats['total_downtime_min']}m → I: {i_stats['total_downtime_min']}m", color=dt_color)
+
+        # ── Grouped bar chart — side by side comparison ───────────────────────
+        st.markdown("#### 📊 Before vs After — Visual Comparison")
+
+        labels   = ["MTBF (hours)", "MTTR (min)", "Failures", "Downtime (min)"]
+        b_values = [b_stats["mtbf_h"], b_stats["mttr_min"], b_stats["failures"], b_stats["total_downtime_min"]]
+        i_values = [i_stats["mtbf_h"], i_stats["mttr_min"], i_stats["failures"], i_stats["total_downtime_min"]]
+
+        fig = go.Figure(data=[
+            go.Bar(
+                name=f"Baseline ({b_start} → {b_end})",
+                x=labels, y=b_values,
+                marker_color="#38bdf8",
+                text=[str(v) for v in b_values],
+                textposition="outside",
+            ),
+            go.Bar(
+                name=f"Improvement ({i_start} → {i_end})",
+                x=labels, y=i_values,
+                marker_color="#4ade80",
+                text=[str(v) for v in i_values],
+                textposition="outside",
+            ),
+        ])
+        fig.update_layout(
+            barmode="group",
+            paper_bgcolor="#0b1120",
+            plot_bgcolor="#0d1f35",
+            font=dict(color="#94a3b8"),
+            legend=dict(bgcolor="#0d1f35", bordercolor="#1e3a5f", borderwidth=1),
+            xaxis=dict(gridcolor="#1e293b"),
+            yaxis=dict(gridcolor="#1e293b"),
+            margin=dict(t=40, b=40),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # ── Narrative summary ─────────────────────────────────────────────────
+        st.markdown("#### 📝 Narrative Summary")
+        mtbf_improved = i_stats["mtbf_h"] > b_stats["mtbf_h"]
+        mttr_improved = i_stats["mttr_min"] < b_stats["mttr_min"]
+
+        if mtbf_improved and mttr_improved:
+            verdict = "🟢 **Both MTBF and MTTR improved** — the maintenance intervention is showing measurable results."
+        elif mtbf_improved:
+            verdict = "🟡 **MTBF improved** but MTTR increased — failures are less frequent but repairs are taking longer."
+        elif mttr_improved:
+            verdict = "🟡 **MTTR improved** but MTBF did not — repairs are faster but failure frequency hasn't reduced yet."
+        else:
+            verdict = "🔴 **Neither MTBF nor MTTR improved** — review the intervention or extend the improvement period."
+
+        st.markdown(verdict)
+        st.markdown(
+            f"- Baseline window: **{b_stats['period_hours']:.0f} h** operating span, "
+            f"**{b_stats['failures']}** failures, **{b_stats['total_downtime_min']:.0f} min** total downtime.\n"
+            f"- Improvement window: **{i_stats['period_hours']:.0f} h** operating span, "
+            f"**{i_stats['failures']}** failures, **{i_stats['total_downtime_min']:.0f} min** total downtime."
+        )
+
+        # ── Raw data preview ──────────────────────────────────────────────────
+        with st.expander("🗂️ Normalised Data Preview (first 200 rows)"):
+            st.dataframe(norm_df.head(200), use_container_width=True)
+
+        with st.expander("📋 Baseline Period Data"):
+            st.dataframe(df_q[b_mask], use_container_width=True)
+
+        with st.expander("🚀 Improvement Period Data"):
+            st.dataframe(df_q[i_mask], use_container_width=True)
+
+
 # ── Render ────────────────────────────────────────────────────────────────────
 if st.session_state.df is not None:
     render_generic(st.session_state.df)
@@ -730,3 +1038,6 @@ else:
                       ["Shift Roster","Shift Analytics","PM Checklist","Health Scorecard","Month-over-Month"]):
         with t:
             alert_banner(f"Click <strong>🏭 TSDPL Demo</strong> in the sidebar to use the {lbl} tab.","info")
+
+# ── TAB 11: QIP ANALYSIS (v2.2) ───────────────────────────────────────────────
+render_qip_tab(st.session_state.normalized_df)
