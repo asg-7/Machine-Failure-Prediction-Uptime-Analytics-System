@@ -1,0 +1,17 @@
+[theme]
+# Primary brand colour — Tata Blue
+primaryColor        = "#0080C7"
+
+# Main content area background — Industrial White
+backgroundColor     = "#F4F7F9"
+
+# Widget input backgrounds (selectbox, text_input, number_input, etc.)
+# ⚠️  MUST be a light colour — Streamlit injects this as inline style on
+#     every widget control div. Setting it dark (#1A2C3E) makes text in
+#     main-area dropdowns invisible even when CSS !important is applied.
+secondaryBackgroundColor = "#FFFFFF"
+
+# Body text colour — Deep Steel Blue
+textColor           = "#1A2C3E"
+
+font                = "sans serif"
